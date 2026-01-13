@@ -1,20 +1,29 @@
 """
-TechCheck Activity Provider — uso de Adapter (PlatformRequestAdapter/PlatformResponseAdapter) e Facade (TechCheckFacade)
+TechCheck Activity Provider — uso de Adapter (PlatformRequestAdapter/PlatformResponseAdapter),
+Facade (TechCheckFacade) e Observer (padrão comportamental) para reagir a eventos de deploy.
+
 Endpoints:
 - GET  /
 - GET  /config
 - GET  /config/params
 - POST /deploy
 - GET  /analytics/list
-- GET  /analytics  
+- GET  /analytics
 """
 
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Protocol
+
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+
+
+# -----------------------------
+# Domínio (Quiz) + Factory
+# -----------------------------
 
 class Quiz:
     """Classe principal de quiz genérico."""
@@ -32,17 +41,21 @@ class Quiz:
             "num_questions": self.num_questions,
         }
 
+
 class OpenSourceQuiz(Quiz):
     pass  # Lógica de quiz sobre open source projects
+
 
 class FinTechQuiz(Quiz):
     pass  # Lógica de quiz sobre tecnologias para finanças
 
+
 class BigDataQuiz(Quiz):
     pass  # Lógica de quiz sobre alto volume de dados
 
+
 class QuizFactory:
-    # Fábrica de quizzes
+    """Fábrica de quizzes (padrão de criação já existente)."""
 
     @staticmethod
     def create_quiz(config: Dict[str, Any]) -> Quiz:
@@ -59,7 +72,9 @@ class QuizFactory:
         return Quiz(tech_stack, difficulty, num_questions)
 
 
-# Repositórios para persistência em memória
+# -----------------------------
+# Repositórios (persistência em memória)
+# -----------------------------
 
 class ActivityRepository:
     """Persistência de activities em memória."""
@@ -73,6 +88,7 @@ class ActivityRepository:
     def get(self, instance_id: str) -> Optional[Dict[str, Any]]:
         return self._activities.get(instance_id)
 
+
 class AnalyticsRepository:
     """Persistência de analytics em memória."""
 
@@ -85,7 +101,10 @@ class AnalyticsRepository:
     def save(self, instance_id: str, analytics: List[Dict[str, Any]]) -> None:
         self._store[instance_id] = analytics
 
+
+# -----------------------------
 # DTOs internos (modelo do domínio / aplicação)
+# -----------------------------
 
 @dataclass(frozen=True)
 class QuizConfig:
@@ -93,10 +112,12 @@ class QuizConfig:
     difficulty: str = "medium"
     num_questions: int = 10
 
+
 @dataclass(frozen=True)
 class DeployRequest:
     instance_id: str
     config: QuizConfig
+
 
 @dataclass(frozen=True)
 class DeployResult:
@@ -104,7 +125,10 @@ class DeployResult:
     quiz: Dict[str, Any]
     message: str = "TechCheck deploy efectuado com sucesso"
 
+
+# -----------------------------
 # Adapter (Request/Response) — traduz contrato externo <-> interno
+# -----------------------------
 
 class PlatformRequestAdapter:
     """Adapter: converte payload externo (JSON HTTP) em DTO interno estável."""
@@ -147,10 +171,9 @@ class PlatformRequestAdapter:
             ),
         )
 
+
 class PlatformResponseAdapter:
-    """
-    Adapter: converte resultados internos em JSON esperado pela plataforma.
-    """
+    """Adapter: converte resultados internos em JSON esperado pela plataforma."""
 
     @staticmethod
     def deploy_ok(result: DeployResult) -> Dict[str, Any]:
@@ -165,13 +188,70 @@ class PlatformResponseAdapter:
     def error(message: str) -> Dict[str, Any]:
         return {"error": message}
 
+
+# -----------------------------
+# Observer (padrão comportamental)
+# -----------------------------
+
+class ActivityObserver(Protocol):
+    """
+    Observer: recebe notificações de eventos do ciclo de vida de uma activity.
+    Mantemos propositalmente simples: update(event, instance_id, payload).
+    """
+
+    def update(self, event: str, instance_id: str, payload: Dict[str, Any]) -> None:
+        ...
+
+
+class DeployAnalyticsObserver:
+    """
+    Observer: ao ocorrer um deploy, inicializa/regista analytics base
+    no AnalyticsRepository (mantendo coerência com /analytics e /analytics/list).
+    """
+
+    def __init__(self, analytics_repository: AnalyticsRepository):
+        self.analytics_repository = analytics_repository
+
+    def update(self, event: str, instance_id: str, payload: Dict[str, Any]) -> None:
+        if event != "DEPLOYED":
+            return
+
+        cfg = payload.get("config", {}) if isinstance(payload, dict) else {}
+        difficulty = cfg.get("difficulty", "medium")
+
+        # Pequena variação de valores iniciais apenas para ilustrar que o Observer
+        # pode reagir ao contexto, sem alterar o fluxo principal do Facade.
+        base_score = {"easy": 70, "medium": 60, "hard": 50, "super": 45, "geek": 40}.get(difficulty, 60)
+        base_time = {"easy": 300, "medium": 420, "hard": 540, "super": 650, "geek": 720}.get(difficulty, 420)
+
+        initial_analytics = [
+            {"userId": "student1", "score": base_score + 25, "completion_time": base_time - 80, "correct_answers": 17},
+            {"userId": "student2", "score": base_score, "completion_time": base_time, "correct_answers": 12},
+        ]
+
+        self.analytics_repository.save(instance_id, initial_analytics)
+
+
+# -----------------------------
 # Facade — orquestra subsistemas e expõe operações simples
+# (agora também atua como Subject do Observer)
+# -----------------------------
 
 class TechCheckFacade:
     def __init__(self, activity_repository: ActivityRepository, analytics_repository: AnalyticsRepository):
         self.activity_repository = activity_repository
         self.analytics_repository = analytics_repository
+        self._observers: List[ActivityObserver] = []
 
+    # Subject API
+    def attach(self, observer: ActivityObserver) -> None:
+        self._observers.append(observer)
+
+    def notify(self, event: str, instance_id: str, payload: Dict[str, Any]) -> None:
+        for obs in list(self._observers):
+            obs.update(event, instance_id, payload)
+
+    # Casos de uso
     def deploy(self, req: DeployRequest) -> DeployResult:
         cfg_dict = {
             "tech_stack": req.config.tech_stack,
@@ -181,10 +261,13 @@ class TechCheckFacade:
 
         quiz = QuizFactory.create_quiz(cfg_dict)
 
-        self.activity_repository.save(
-            req.instance_id,
-            {"config": cfg_dict, "quiz": quiz.to_dict()},
-        )
+        payload = {"config": cfg_dict, "quiz": quiz.to_dict()}
+
+        # 1) fluxo principal (estável)
+        self.activity_repository.save(req.instance_id, payload)
+
+        # 2) efeitos secundários (desacoplados via Observer)
+        self.notify("DEPLOYED", req.instance_id, payload)
 
         return DeployResult(instance_id=req.instance_id, quiz=quiz.to_dict())
 
@@ -233,19 +316,35 @@ class TechCheckFacade:
             raise ValueError("instanceId é obrigatório")
 
         existing = self.analytics_repository.get(instance_id)
+
+        # Se não houver analytics, mantém fallback (compatível com o teu comportamento atual)
         analytics = existing or [
             {"userId": "student1", "score": 85, "completion_time": 320, "correct_answers": 17},
             {"userId": "student2", "score": 60, "completion_time": 450, "correct_answers": 12},
         ]
         return {"instanceId": instance_id, "analytics": analytics}
 
+
+# -----------------------------
+# Bootstrap (wiring)
+# -----------------------------
+
 activity_repository = ActivityRepository()
 analytics_repository = AnalyticsRepository()
 facade = TechCheckFacade(activity_repository, analytics_repository)
 
+# Registar Observer(s)
+facade.attach(DeployAnalyticsObserver(analytics_repository))
+
+
+# -----------------------------
+# Rotas (Flask)
+# -----------------------------
+
 @app.route("/")
 def home():
     return "TechCheck Activity Provider online!"
+
 
 @app.route("/config")
 def config_page():
@@ -263,9 +362,11 @@ def config_page():
     </html>
     """
 
+
 @app.route("/config/params")
 def config_params():
     return jsonify(facade.get_config_params())
+
 
 @app.route("/deploy", methods=["POST"])
 def deploy_activity():
@@ -280,9 +381,11 @@ def deploy_activity():
     except Exception:
         return jsonify(PlatformResponseAdapter.error("Erro interno ao processar deploy")), 500
 
+
 @app.route("/analytics/list")
 def analytics_list():
     return jsonify(facade.analytics_catalog())
+
 
 @app.route("/analytics")
 def analytics_values():
@@ -291,6 +394,7 @@ def analytics_values():
         return jsonify(facade.analytics_values(instance_id))
     except ValueError as e:
         return jsonify(PlatformResponseAdapter.error(str(e))), 400
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
